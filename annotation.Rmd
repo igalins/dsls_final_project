@@ -1,0 +1,426 @@
+---
+title: "Annotation"
+output: pdf_document
+date: "2025-07-09"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+#illumina 450k annotation package
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+library(minfi)
+
+#full probe annotation
+anno <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+head(anno)
+```
+
+```{r}
+#load seperated features
+lr_genes <- read.csv("lr_genes.csv")
+lr_cpg <- read.csv("lr_cpg.csv")
+
+rf_genes <- read.csv("rf_genes.csv")
+rf_cpg <- read.csv("rf_cpg.csv")
+
+svm_genes <- read.csv("svm_genes.csv")
+svm_cpg <- read.csv("svm_cpg.csv")
+```
+
+### Methylation probes 
+
+```{r}
+#annotated CpG sites and drop unnecessary columns
+anno_cpg_lr <- anno[rownames(anno) %in% lr_cpg$Feature, ]
+anno_cpg_lr <- merge(lr_cpg, anno_cpg_lr, by.x = "Feature", by.y = "row.names")
+anno_cpg_lr <- anno_cpg_lr[, c("Feature", "MeanAbsCoefficient", "chr", "pos", "UCSC_RefGene_Name", "UCSC_RefGene_Group")]
+
+anno_cpg_rf <- anno[rownames(anno) %in% rf_cpg$Feature, ]
+anno_cpg_rf <- merge(rf_cpg, anno_cpg_rf, by.x = "Feature", by.y = "row.names")
+anno_cpg_rf <- anno_cpg_rf[, c("Feature", "Importance", "chr", "pos", "UCSC_RefGene_Name", "UCSC_RefGene_Group")]
+
+anno_cpg_svm <- anno[rownames(anno) %in% svm_cpg$Feature, ]
+anno_cpg_svm <- merge(svm_cpg, anno_cpg_svm, by.x = "Feature", by.y = "row.names")
+anno_cpg_svm <- anno_cpg_svm[, c("Feature", "F_score", "chr", "pos", "UCSC_RefGene_Name", "UCSC_RefGene_Group")]
+
+
+```
+
+### Genes
+
+```{r}
+library(biomaRt)
+```
+
+```{r}
+#hg19 <-> GRCh37
+mart <- useMart("ENSEMBL_MART_ENSEMBL", dataset = "hsapiens_gene_ensembl",
+                host = "https://grch37.ensembl.org")
+
+map_ensembl_to_common <- function(df, score_colname) {
+  mapping <- getBM(attributes = c('ensembl_gene_id', 'hgnc_symbol'),
+                   filters = 'ensembl_gene_id',
+                   values = df$Feature,
+                   mart = mart)
+  df_annotated <- merge(df, mapping, by.x = "Feature", by.y = "ensembl_gene_id", all.x = TRUE)
+  df_annotated <- df_annotated[, c("Feature", score_colname, "hgnc_symbol")]
+  return(df_annotated)
+}
+
+#annotate each gene set
+anno_genes_lr <- map_ensembl_to_common(lr_genes, "MeanAbsCoefficient")
+anno_genes_rf <- map_ensembl_to_common(rf_genes, "Importance")
+anno_genes_svm <- map_ensembl_to_common(svm_genes, "F_score")
+```
+
+common genes across models
+
+```{r}
+lr_gene_symbols <- na.omit(unique(anno_genes_lr$Feature))
+rf_gene_symbols <- na.omit(unique(anno_genes_rf$Feature))
+svm_gene_symbols <- na.omit(unique(anno_genes_svm$Feature))
+
+#find common genes
+common_genes <- Reduce(intersect, list(lr_gene_symbols, rf_gene_symbols, svm_gene_symbols))
+
+```
+
+
+
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("clusterProfiler")
+BiocManager::install("fgsea")
+install.packages("msigdbr")
+```
+
+```{r}
+library(clusterProfiler)
+library(fgsea)
+library(data.table)
+library(msigdbr)
+library(tidyverse)
+library(org.Hs.eg.db)
+```
+```{r}
+#rank vectors
+prepare_ranked_vector <- function(df, score_colname) {
+  df_clean <- df %>%
+    filter(!is.na(Feature)) %>%
+    group_by(Feature) %>%
+    summarise(score = mean(.data[[score_colname]]), .groups = "drop")
+  
+  ranked_vector <- df_clean$score
+  names(ranked_vector) <- df_clean$Feature
+  ranked_vector <- sort(ranked_vector, decreasing = TRUE)
+  
+  return(ranked_vector)
+}
+
+ranked_lr <- prepare_ranked_vector(anno_genes_lr, "MeanAbsCoefficient")
+ranked_rf <- prepare_ranked_vector(anno_genes_rf, "Importance")
+ranked_svm <- prepare_ranked_vector(anno_genes_svm, "F_score")
+```
+
+```{r}
+#gene sets
+msigdbr_ensembl <- msigdbr(species = "Homo sapiens", category = "H") %>%
+    dplyr::select(gs_name, ensembl_gene) %>%
+    dplyr::filter(!is.na(ensembl_gene))
+
+pathways_ensembl <- split(msigdbr_ensembl$ensembl_gene, msigdbr_ensembl$gs_name)
+```
+### Hallmark GSEA
+
+Logistic regression
+```{r}
+#fgseaMultilevel more stable for small feature lists!!
+
+fgsea_lr <- fgseaMultilevel(pathways = pathways_ensembl,
+                  stats = ranked_lr,
+                  scoreType = "pos"
+                  )
+```
+
+Random Forrest
+```{r}
+fgsea_rf <- fgseaMultilevel(pathways = pathways_ensembl,
+                  stats = ranked_rf,
+                  scoreType = "pos"
+                  )
+```
+
+SVM
+```{r}
+fgsea_svm <- fgseaMultilevel(pathways = pathways_ensembl,
+                  stats = ranked_svm,
+                  scoreType = "pos"
+                  )
+```
+
+Mapping leading gene symbol to ensembl ID
+```{r}
+ensembl_to_symbol <- unique(do.call(rbind, list(
+  anno_genes_lr[, c("Feature", "hgnc_symbol")],
+  anno_genes_rf[, c("Feature", "hgnc_symbol")],
+  anno_genes_svm[, c("Feature", "hgnc_symbol")]
+)))
+
+
+ensembl_map <- setNames(ensembl_to_symbol$hgnc_symbol, ensembl_to_symbol$Feature)
+
+#leading edge symbols
+add_leading_genes <- function(fgsea_res, model_name) {
+  fgsea_res$leadingEdge_symbols <- sapply(fgsea_res$leadingEdge, function(gene_ids) {
+    paste(na.omit(ensembl_map[gene_ids]), collapse = ", ")
+  })
+  fgsea_res$Pathway <- paste0(fgsea_res$pathway, " (", fgsea_res$leadingEdge_symbols, ")")
+  fgsea_res$model <- model_name
+  return(fgsea_res)
+}
+
+fgsea_lr_annot <- add_leading_genes(fgsea_lr, "LR")
+fgsea_rf_annot <- add_leading_genes(fgsea_rf, "RF")
+fgsea_svm_annot <- add_leading_genes(fgsea_svm, "SVM")
+
+# Combine into one dataframe
+fgsea_combined <- dplyr::bind_rows(fgsea_lr_annot, fgsea_rf_annot, fgsea_svm_annot)
+```
+
+Plot
+```{r}
+library(ggplot2)
+
+# Extract first leading gene for grouping
+plot_data <- fgsea_combined %>%
+  mutate(leading_gene = sub(",.*", "", leadingEdge_symbols))  # take first gene
+
+# Custom sorting: group by leading gene, then NES
+plot_data <- plot_data %>%
+  arrange(leading_gene, desc(NES)) %>%
+  mutate(Pathway = factor(Pathway, levels = unique(Pathway)))
+
+
+ggplot(plot_data, aes(x = model, y = Pathway, size = -log10(padj), color = NES)) +
+  geom_point(alpha = 0.99) +
+  scale_color_distiller(palette = "YlGnBu", direction = 1) +
+  scale_size(range = c(2, 10)) +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.y = element_text(size = 7),
+        legend.position = "right") +
+  labs(
+    title = "Hallmark GSEA Bubble Plot (LR, RF, SVM)",
+    x = "Model",
+    y = "Pathway (Leading Genes)",
+    size = "-log10(FDR)",
+    color = "NES"
+  )
+```
+
+
+### ORA
+
+```{r}
+#ensembl to entrez conversion
+convert_to_entrez <- function(df) {
+  entrez <- bitr(df$Feature,
+                 fromType = "ENSEMBL",
+                 toType = "ENTREZID",
+                 OrgDb = org.Hs.eg.db)
+  return(unique(entrez$ENTREZID))
+}
+
+entrez_lr  <- convert_to_entrez(lr_genes)
+entrez_rf  <- convert_to_entrez(rf_genes)
+entrez_svm <- convert_to_entrez(svm_genes)
+```
+
+#### KEGG 
+```{r}
+#KEGG enrichment
+enrich_kegg_safe <- function(entrez_ids) {
+  enrichKEGG(gene = entrez_ids,
+             organism = "hsa",
+             pvalueCutoff = 0.05,
+             pAdjustMethod = "BH")
+}
+
+ekegg_lr  <- enrich_kegg_safe(entrez_lr)
+ekegg_rf  <- enrich_kegg_safe(entrez_rf)
+ekegg_svm <- enrich_kegg_safe(entrez_svm)
+```
+
+Plot
+```{r}
+# Combine enriched GO terms from all models
+kegg_df <- bind_rows(
+  mutate(as.data.frame(ekegg_lr@result), model = "LR"),
+  mutate(as.data.frame(ekegg_rf@result), model = "RF"),
+  mutate(as.data.frame(ekegg_svm@result), model = "SVM")
+)
+
+# Filter significant terms
+kegg_plot <- kegg_df %>%
+  filter(p.adjust < 0.05) %>%
+  mutate(label = paste0(Description, " (", geneID, ")"))
+
+# Plot
+ggplot(kegg_plot, aes(x = model, y = label, size = Count, color = -log10(p.adjust))) +
+  geom_point(alpha = 0.8) +
+  scale_color_distiller(palette = "YlGnBu", direction = 1) +
+  scale_size(range = c(2, 10)) +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.y = element_text(size = 7)) +
+  labs(
+    title = "KEGG Enrichment",
+    x = "Model",
+    y = "KEGG Term (Matching Genes)",
+    size = "Gene Count",
+    color = "-log10(FDR)"
+  )
+```
+
+#### GO Biological Processes
+```{r}
+#GO BP
+enrich_go_safe <- function(entrez_ids) {
+  enrichGO(gene = entrez_ids,
+           OrgDb = org.Hs.eg.db,
+           keyType = "ENTREZID",
+           ont = "BP",
+           pAdjustMethod = "BH",
+           pvalueCutoff = 0.05,
+           qvalueCutoff = 0.2,
+           readable = TRUE)
+}
+
+ego_lr  <- enrich_go_safe(entrez_lr)
+ego_rf  <- enrich_go_safe(entrez_rf)
+ego_svm <- enrich_go_safe(entrez_svm)
+```
+
+Plot
+```{r}
+# Combine enriched GO terms from all models
+go_df <- bind_rows(
+  mutate(as.data.frame(ego_lr@result), model = "LR"),
+  mutate(as.data.frame(ego_rf@result), model = "RF"),
+  mutate(as.data.frame(ego_svm@result), model = "SVM")
+)
+
+# Filter significant terms
+go_plot <- go_df %>%
+  filter(p.adjust < 0.05) %>%
+  mutate(label = paste0(Description, " (", geneID, ")"))
+
+# Plot
+ggplot(go_plot, aes(x = model, y = label, size = Count, color = -log10(p.adjust))) +
+  geom_point(alpha = 0.8) +
+  scale_color_distiller(palette = "YlGnBu", direction = 1) +
+  scale_size(range = c(2, 10)) +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.y = element_text(size = 7)) +
+  labs(
+    title = "GO Biological Process Enrichment",
+    x = "Model",
+    y = "GO Term (Matching Genes)",
+    size = "Gene Count",
+    color = "-log10(FDR)"
+  )
+```
+#### Hallmark
+```{r}
+#hallmark in symbol form
+msigdbr_hallmark_symbol <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  dplyr::select(gs_name, gene_symbol)
+
+#TERM2GENE
+hallmark_sets <- split(msigdbr_hallmark_symbol$gene_symbol, msigdbr_hallmark_symbol$gs_name)
+
+symbols_lr  <- na.omit(unique(anno_genes_lr$hgnc_symbol))
+symbols_rf  <- na.omit(unique(anno_genes_rf$hgnc_symbol))
+symbols_svm <- na.omit(unique(anno_genes_svm$hgnc_symbol))
+```
+
+```{r}
+#run enrichemnt
+enrich_hallmark <- function(symbols) {
+  enricher(
+    gene = symbols,
+    TERM2GENE = msigdbr_hallmark_symbol,
+    pvalueCutoff = 0.05,
+    pAdjustMethod = "BH"
+  )
+}
+
+ehallmark_lr  <- enrich_hallmark(symbols_lr)
+ehallmark_rf  <- enrich_hallmark(symbols_rf)
+ehallmark_svm <- enrich_hallmark(symbols_svm)
+```
+
+### Methylation sites with genes
+
+```{r}
+genes_of_interest <- c("GALNT10", "TNF", "CD1B", 
+                       "SPARCL1", "LPAR6", "IFITM2", 
+                       "FAH", "SPDEF", "WNT7B")
+
+cpgs_with_genes <- function(anno_df, genes) {
+  anno_df %>%
+    mutate(mapped_genes = strsplit(as.character(UCSC_RefGene_Name), ";")) %>%
+    rowwise() %>%
+    mutate(has_match = any(mapped_genes %in% genes)) %>%
+    filter(has_match) %>%
+    ungroup()
+}
+
+anno_cpg_lr <- as.data.frame(anno_cpg_lr)
+anno_cpg_rf <- as.data.frame(anno_cpg_rf)
+anno_cpg_svm <- as.data.frame(anno_cpg_svm)
+
+matched_cpgs_lr  <- cpgs_with_genes(anno_cpg_lr, genes_of_interest)
+matched_cpgs_rf  <- cpgs_with_genes(anno_cpg_rf, genes_of_interest)
+matched_cpgs_svm <- cpgs_with_genes(anno_cpg_svm, genes_of_interest)
+
+```
+
+methyl sites near genes
+
+```{r}
+#biomaRt for TSS 
+tss_data <- getBM(
+  attributes = c("hgnc_symbol", "chromosome_name", "transcription_start_site", "strand"),
+  filters = "hgnc_symbol",
+  values = genes_of_interest,
+  mart = mart
+)
+
+
+tss_data <- tss_data %>%
+  filter(str_detect(chromosome_name, "^[0-9XY]+$")) %>%
+  mutate(chr = paste0("chr", chromosome_name))
+
+find_cpgs_near_tss <- function(cpg_df, tss_df, window_kb = 20) {
+  cpg_df <- as.data.frame(cpg_df)  
+  
+  window <- window_kb * 1000
+  
+  nearby_cpgs <- inner_join(cpg_df, tss_df, by = "chr") %>%
+    mutate(distance = pos - transcription_start_site,
+           distance_abs = abs(distance)) %>%
+    filter(distance_abs <= window)
+  
+  return(nearby_cpgs)
+}
+
+nearby_lr  <- find_cpgs_near_tss(anno_cpg_lr, tss_data, window_kb = 10)
+nearby_rf  <- find_cpgs_near_tss(anno_cpg_rf, tss_data, window_kb = 10)
+nearby_svm <- find_cpgs_near_tss(anno_cpg_svm, tss_data, window_kb = 10)
+
+```
+

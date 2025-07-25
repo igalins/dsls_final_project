@@ -1,0 +1,118 @@
+---
+title: "diff_methyl_2"
+author: "Leon Igal Inselberg Barbut"
+date: "7/10/2025"
+output: pdf_document
+---
+```{r include=FALSE}
+library(minfi)
+library(limma)
+library(pheatmap)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+```
+```{r}
+beta <- read.csv("preprocessed_methylation_data.csv", row.names = 1, check.names = FALSE)
+dim(beta)
+```
+```{r}
+clinical <- read.csv("preprocessed_clinical_train.csv", row.names = 1, stringsAsFactors = FALSE)
+```
+```{r}
+# Align
+common_samples <- intersect(colnames(beta), rownames(clinical))
+beta <- beta[, common_samples]
+clinical <- clinical[common_samples, ]
+
+# Check
+all(colnames(beta) == rownames(clinical))
+```
+```{r}
+stage <- factor(clinical$ajcc_pathologic_stage.diagnoses, levels = c("I", "II", "III+IV"))
+table(stage)
+```
+```{r}
+M <- log2(beta / (1 - beta))
+```
+design: For each sample, you get a row of 0s and 1s indicating which group (stage) it belongs to.
+The resulting matrix has columns = number of levels in stage.
+```{r}
+design <- model.matrix(~ 0 + stage) #
+colnames(design) <- levels(stage)
+```
+```{r}
+colnames(design) <- make.names(colnames(design))
+```
+```{r}
+contrast.matrix <- makeContrasts(
+  II_vs_I = II - I,
+  IIIIV_vs_I = III.IV - I,
+  IIIIV_vs_II = III.IV - II,
+  levels = design
+)
+contrast.matrix
+```
+```{r}
+fit <- lmFit(M, design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+```
+```{r}
+comparisons <- c("II_vs_I", "IIIIV_vs_I", "IIIIV_vs_II")
+
+dmps_list <- list()
+
+for (comp in comparisons) {
+  
+  # Extract all results for this comparison
+  topTable_DMP <- topTable(fit2, coef = comp, number = Inf, adjust = "fdr")
+  
+  # Filter: FDR < 0.1
+  dmps <- topTable_DMP[
+    topTable_DMP$adj.P.Val < 0.1,
+  ]
+  
+  if (nrow(dmps) > 0) {
+    # Add probe names and comparison label
+    dmps$Probe <- rownames(dmps)
+    dmps$Comparison <- comp
+
+    # Reorder columns
+    dmps <- dmps[, c("Probe", "Comparison", setdiff(colnames(dmps), c("Probe", "Comparison")))]
+
+    # Store
+    dmps_list[[comp]] <- dmps
+
+    cat("\n", comp, ":", nrow(dmps), "DMPs extracted.")
+  } else {
+    cat("\n️", comp, ": No significant DMPs found with current thresholds.")
+  }
+}
+
+```
+```{r}
+dmps_list$IIIIV_vs_II$adj.P.Val
+```
+```{r}
+
+# Plot the raw p-values
+hist(topTable_DMP$P.Value,
+     breaks = 50,
+     col = "forestgreen",
+     border = "white",
+     main = "P-value Distribution",
+     xlab = "P-value",
+     ylab = "Frequency")
+
+```
+```{r}
+library(ggplot2)
+
+topTable_DMP$Significant <- topTable_DMP$adj.P.Val < 0.1
+
+ggplot(topTable_DMP, aes(x = logFC, y = -log10(adj.P.Val), color = Significant)) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("grey", "red")) +
+  labs(title = "Volcano Plot", x = "logFC", y = "-log10(FDR)") +
+  theme_minimal()
+
+```
