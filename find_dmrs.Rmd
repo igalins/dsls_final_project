@@ -116,3 +116,12 @@ ggplot(topTable_DMP, aes(x = logFC, y = -log10(adj.P.Val), color = Significant))
   theme_minimal()
 
 ```
+```{r}
+all_dmps <- do.call(rbind, dmps_list)
+
+write.csv(
+  all_dmps,
+  file = "DMPs_All_Comparisons.csv",
+  row.names = FALSE
+)
+```
